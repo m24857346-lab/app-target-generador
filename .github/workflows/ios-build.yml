@@ -1,0 +1,135 @@
+name: iOS Build
+run-name: iOS Build ${{ inputs.build_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        description: 'Unique build identifier'
+        required: true
+        type: string
+      snapshot_ref:
+        description: 'Ref holding the working-tree snapshot to build'
+        required: false
+        type: string
+        default: ''
+      ios_path:
+        description: 'Path to iOS project'
+        required: false
+        type: string
+        default: '.'
+      scheme:
+        description: 'Xcode scheme'
+        required: false
+        type: string
+        default: ''
+      use_signing:
+        description: 'Enable code signing'
+        required: false
+        type: boolean
+        default: false
+      configuration:
+        description: 'Build configuration'
+        required: false
+        type: string
+        default: 'Release'
+      flutter_version:
+        description: 'Flutter version'
+        required: false
+        type: string
+        default: ''
+      jdk_version:
+        description: 'JDK version'
+        required: false
+        type: string
+        default: '17'
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v7
+
+      - name: Clone source
+        run: git clone --depth=1 https://github.com/eleodevv/Admin-Panel-Target.git source
+
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        working-directory: source/app-movil/target-app
+        run: npm ci
+
+      - name: Expo prebuild
+        working-directory: source/app-movil/target-app
+        run: npx expo prebuild --clean --platform ios
+
+      - name: Install pods
+        working-directory: source/app-movil/target-app/ios
+        run: pod install
+
+      - name: Build IPA
+        env:
+          BUILD_ID: ${{ inputs.build_id }}
+          CONFIGURATION: ${{ inputs.configuration }}
+        run: |
+          set -e
+          cd source/app-movil/target-app/ios
+          WORKSPACE=$(find . -maxdepth 1 -name "*.xcworkspace" | head -1)
+          SCHEME=$(basename "$WORKSPACE" .xcworkspace)
+          DERIVED_DATA="${GITHUB_WORKSPACE}/DerivedData"
+
+          echo "Building $SCHEME ($CONFIGURATION)..."
+
+          xcodebuild \
+            -workspace "$WORKSPACE" \
+            -scheme "$SCHEME" \
+            -configuration "$CONFIGURATION" \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$DERIVED_DATA" \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            -quiet
+
+          APP_PATH=$(xcodebuild \
+            -workspace "$WORKSPACE" \
+            -scheme "$SCHEME" \
+            -configuration "$CONFIGURATION" \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$DERIVED_DATA" \
+            -showBuildSettings -json 2>/dev/null \
+            | jq -r 'map(.buildSettings)
+                     | map(select(.PRODUCT_TYPE == "com.apple.product-type.application"
+                                  and (.TARGET_BUILD_DIR | contains("-iphoneos"))))
+                     | map(.TARGET_BUILD_DIR + "/" + .FULL_PRODUCT_NAME)
+                     | first // empty' || true)
+
+          if [ ! -d "$APP_PATH" ]; then
+            APP_PATH=$(find "$DERIVED_DATA/Build/Products/${CONFIGURATION}-iphoneos" -maxdepth 1 -name "*.app" -type d -print -quit)
+          fi
+
+          echo "Found: $APP_PATH"
+          cd "$GITHUB_WORKSPACE"
+          mkdir -p build/Payload
+          cp -R "$APP_PATH" build/Payload/
+          cd build
+          zip -rq "$BUILD_ID.ipa" Payload
+          rm -rf Payload
+          echo "Created: build/$BUILD_ID.ipa"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v7
+        with:
+          name: ipa
+          path: build/*.ipa
+          retention-days: 7
+          if-no-files-found: error
