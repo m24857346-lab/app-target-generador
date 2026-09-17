@@ -49,59 +49,124 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
-      - name: Checkout this repo
+      - name: Checkout repository
         uses: actions/checkout@v7
 
-      - name: Clone source
-        run: git clone --depth=1 https://github.com/eleodevv/Admin-Panel-Target.git source
+      - name: Checkout snapshot
+        if: inputs.snapshot_ref != ''
+        env:
+          SNAPSHOT_REF: ${{ inputs.snapshot_ref }}
+        run: |
+          set -e
+          git fetch --depth=1 origin "+$SNAPSHOT_REF:refs/heads/snapshot"
+          git checkout --force snapshot
+          echo "Building $(git rev-parse --short HEAD)"
 
       - name: Setup Xcode
         uses: maxim-lobanov/setup-xcode@v1
         with:
           xcode-version: latest-stable
 
+      - name: Detect project type
+        id: detect
+        run: |
+          APP_DIR="app-movil/target-app"
+          if [ -f "$APP_DIR/package.json" ] && grep -q '"expo"' "$APP_DIR/package.json"; then
+            echo "type=expo" >> $GITHUB_OUTPUT
+            echo "app_dir=$APP_DIR" >> $GITHUB_OUTPUT
+          elif [ -f "package.json" ] && grep -q '"expo"' package.json; then
+            echo "type=expo" >> $GITHUB_OUTPUT
+            echo "app_dir=." >> $GITHUB_OUTPUT
+          elif [ -f "package.json" ] && grep -q '"react-native"' package.json; then
+            echo "type=reactnative" >> $GITHUB_OUTPUT
+            echo "app_dir=." >> $GITHUB_OUTPUT
+          elif [ -f "pubspec.yaml" ]; then
+            echo "type=flutter" >> $GITHUB_OUTPUT
+          else
+            echo "type=native" >> $GITHUB_OUTPUT
+          fi
+
       - name: Setup Node.js
+        if: steps.detect.outputs.type == 'reactnative' || steps.detect.outputs.type == 'expo'
         uses: actions/setup-node@v7
         with:
           node-version: '20'
 
       - name: Install dependencies
-        working-directory: source/app-movil/target-app
+        if: steps.detect.outputs.type == 'reactnative' || steps.detect.outputs.type == 'expo'
+        working-directory: ${{ steps.detect.outputs.app_dir || '.' }}
         run: npm ci
 
       - name: Expo prebuild
-        working-directory: source/app-movil/target-app
+        if: steps.detect.outputs.type == 'expo'
+        working-directory: ${{ steps.detect.outputs.app_dir || '.' }}
         run: npx expo prebuild --clean --platform ios
 
       - name: Install pods
-        working-directory: source/app-movil/target-app/ios
-        run: pod install
+        run: |
+          IOS_DIR="${{ steps.detect.outputs.app_dir || '.' }}/ios"
+          if [ -f "$IOS_DIR/Podfile" ]; then
+            cd "$IOS_DIR"
+            pod install
+          fi
 
       - name: Build IPA
         env:
           BUILD_ID: ${{ inputs.build_id }}
+          IOS_PATH: ${{ inputs.ios_path }}
           CONFIGURATION: ${{ inputs.configuration }}
         run: |
           set -e
-          cd source/app-movil/target-app/ios
+
+          if [ -d "app-movil/target-app/ios" ]; then
+            IOS_DIR="app-movil/target-app/ios"
+          else
+            IOS_DIR="${IOS_PATH}/ios"
+            [ -d "$IOS_DIR" ] || IOS_DIR="$IOS_PATH"
+          fi
+
+          cd "$IOS_DIR"
+
           WORKSPACE=$(find . -maxdepth 1 -name "*.xcworkspace" | head -1)
-          SCHEME=$(basename "$WORKSPACE" .xcworkspace)
+          PROJECT=$(find . -maxdepth 1 -name "*.xcodeproj" | head -1)
+
+          if [ -n "$WORKSPACE" ]; then
+            SCHEME=$(basename "$WORKSPACE" .xcworkspace)
+          elif [ -n "$PROJECT" ]; then
+            SCHEME=$(basename "$PROJECT" .xcodeproj)
+          fi
+
+          echo "Building $SCHEME ($CONFIGURATION) in $IOS_DIR..."
+
           DERIVED_DATA="${GITHUB_WORKSPACE}/DerivedData"
 
-          echo "Building $SCHEME ($CONFIGURATION)..."
+          BUILD_CMD="xcodebuild"
+          if [ -n "$WORKSPACE" ]; then
+            BUILD_CMD="$BUILD_CMD -workspace $WORKSPACE"
+          elif [ -n "$PROJECT" ]; then
+            BUILD_CMD="$BUILD_CMD -project $PROJECT"
+          fi
 
-          xcodebuild \
-            -workspace "$WORKSPACE" \
-            -scheme "$SCHEME" \
-            -configuration "$CONFIGURATION" \
-            -destination 'generic/platform=iOS' \
-            -derivedDataPath "$DERIVED_DATA" \
-            COMPILER_INDEX_STORE_ENABLE=NO \
-            CODE_SIGNING_ALLOWED=NO \
-            -quiet
+          BUILD_CMD="$BUILD_CMD -scheme '$SCHEME'"
+          BUILD_CMD="$BUILD_CMD -configuration '$CONFIGURATION'"
+          BUILD_CMD="$BUILD_CMD -destination 'generic/platform=iOS'"
+          BUILD_CMD="$BUILD_CMD -derivedDataPath '$DERIVED_DATA'"
+          BUILD_CMD="$BUILD_CMD COMPILER_INDEX_STORE_ENABLE=NO"
+          BUILD_CMD="$BUILD_CMD CODE_SIGNING_ALLOWED=NO"
+          BUILD_CMD="$BUILD_CMD -quiet"
 
-          APP_PATH=$(xcodebuild \
-            -workspace "$WORKSPACE" \
+          eval $BUILD_CMD
+
+          # Find .app and create IPA
+          if [ -n "$WORKSPACE" ]; then
+            TARGET_FLAG=-workspace
+            TARGET_PATH=$WORKSPACE
+          else
+            TARGET_FLAG=-project
+            TARGET_PATH=$PROJECT
+          fi
+
+          APP_PATH=$(xcodebuild "$TARGET_FLAG" "$TARGET_PATH" \
             -scheme "$SCHEME" \
             -configuration "$CONFIGURATION" \
             -destination 'generic/platform=iOS' \
@@ -114,7 +179,12 @@ jobs:
                      | first // empty' || true)
 
           if [ ! -d "$APP_PATH" ]; then
-            APP_PATH=$(find "$DERIVED_DATA/Build/Products/${CONFIGURATION}-iphoneos" -maxdepth 1 -name "*.app" -type d -print -quit)
+            APP_PATH=$(find "$DERIVED_DATA/Build/Products/${CONFIGURATION}-iphoneos" -maxdepth 1 -name "*.app" -type d -print -quit 2>/dev/null || true)
+          fi
+
+          if [ -z "$APP_PATH" ]; then
+            echo "Error: Could not find .app"
+            exit 1
           fi
 
           echo "Found: $APP_PATH"
@@ -133,3 +203,15 @@ jobs:
           path: build/*.ipa
           retention-days: 7
           if-no-files-found: error
+
+      - name: Build summary
+        if: always()
+        run: |
+          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Build ID:** ${{ inputs.build_id }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status:** ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Configuration:** ${{ inputs.configuration }}" >> $GITHUB_STEP_SUMMARY
+          if [ -f build/*.ipa ]; then
+            IPA_PATH=$(find build -name "*.ipa" -type f | head -1)
+            echo "- **IPA Size:** $(ls -lh "$IPA_PATH" | awk '{print $5}')" >> $GITHUB_STEP_SUMMARY
+          fi
